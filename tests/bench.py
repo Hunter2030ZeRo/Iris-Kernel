@@ -542,7 +542,7 @@ def main():
     print(
         "| T | eager p50 us | unfused p50 us | "
         "fused p50 us | vs eager | vs unfused | "
-        "fused tok/s |"
+        "fused tok/s | saving"
     )
 
     print("|---:|---:|---:|---:|---:|---:|---:|")
