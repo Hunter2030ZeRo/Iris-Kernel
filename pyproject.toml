@@ -1,0 +1,25 @@
+[project]
+name = "iris-kernel"
+version = "0.1.0"
+description = "Fused, portable kernels for GPUs written in TileLang"
+readme = "README.md"
+authors = [
+    { name = '"Hunter2030ZeRo"', email = "minchankim1127@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "tilelang>=0.1.13",
+    "torch>=2.13.0",
+]
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu132"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
