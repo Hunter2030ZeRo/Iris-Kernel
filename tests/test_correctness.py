@@ -8,7 +8,11 @@ from iris_kernel.torch_eager_kv import (
     torch_eager_append,
 )
 
-from iris_kernel.fused_kv import fused_rope_fp16_append
+from iris_kernel.fused_kv import (
+    fused_rope_fp16_append,
+    fused_quantize_pack_int4,
+    fused_rope_int4_paged_append,
+)
 
 
 def test_rope_pos_zero_id():
@@ -321,7 +325,7 @@ def test_rope_preserves_passthrough_dims():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA device required for TileLang kernel"
+    not torch.cuda.is_available(), reason="Iris fused kernel requires CUDA"
 )
 def test_fused_rope_append_matches_eager_ref():
     torch.manual_seed(3407)
@@ -452,3 +456,293 @@ def test_fused_rope_append_matches_eager_ref():
     )
 
     assert torch.equal(v_cache, expected_v)
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Iris fused kernel requires CUDA"
+)
+def test_fused_int_quant_pack_matches_eager(head_dim):
+    torch.manual_seed(3407)
+
+    device = torch.device("cuda")
+
+    x = torch.randn(
+        7,
+        4,
+        head_dim,
+        device=device,
+        dtype=torch.float16,
+    )
+
+    packed = torch.empty(
+        7,
+        4,
+        head_dim // 2,
+        device=device,
+        dtype=torch.uint8,
+    )
+
+    scales = torch.empty(
+        7,
+        4,
+        head_dim // 32,
+        device=device,
+        dtype=torch.float16,
+    )
+
+    q_ref, scale_ref = quantize_int4_groupwise(x, group_size=32)
+
+    packed_ref = pack_int4(q_ref)
+
+    fused_quantize_pack_int4(x, packed, scales)
+
+    torch.cuda.synchronize()
+
+    diff = packed != packed_ref
+
+    if torch.any(diff):
+        idx = diff.nonzero()
+
+        for idx_row in idx[:10]:
+            t, h, byte_idx = map(int, idx_row.tolist())
+
+            got = int(packed[t, h, byte_idx].item())
+            ref = int(packed_ref[t, h, byte_idx].item())
+
+            dim0 = byte_idx * 2
+            dim1 = dim0 + 1
+
+            def decode_nibble(n):
+                return n - 16 if n >= 8 else n
+
+            got_q0 = decode_nibble(got & 0xF)
+            got_q1 = decode_nibble((got >> 4) & 0xF)
+
+            ref_q0 = decode_nibble(ref & 0xF)
+            ref_q1 = decode_nibble((ref >> 4) & 0xF)
+
+            group = dim0 // 32
+            s = scale_ref[t, h, group].float()
+
+            x0 = x[t, h, dim0].float()
+            x1 = x[t, h, dim1].float()
+
+            print(
+                "mismatch:",
+                (t, h, byte_idx),
+                "dims:",
+                (dim0, dim1),
+            )
+            print(
+                "byte got/ref:",
+                hex(got),
+                hex(ref),
+            )
+            print(
+                "q got:",
+                (got_q0, got_q1),
+                "q ref:",
+                (ref_q0, ref_q1),
+            )
+            print(
+                "x:",
+                (x0.item(), x1.item()),
+            )
+            print(
+                "stored scale:",
+                s.item(),
+            )
+
+        print("head_dim:", head_dim)
+        print("mismatch count:", idx.shape[0])
+        print("first mismatches:", idx[:20].cpu())
+
+        # 마지막 차원은 packed bytes.
+        # group_size=32 -> group당 16 bytes
+        for group in range(head_dim // 32):
+            lo = group * 16
+            hi = lo + 16
+
+            group_diff = diff[..., lo:hi]
+
+            print(
+                f"group {group}:",
+                int(group_diff.sum().item()),
+                "byte mismatches",
+            )
+
+        scale_diff = (scales - scale_ref).abs()
+
+        print(
+            "max scale diff:",
+            scale_diff.max().item(),
+        )
+
+    assert torch.equal(packed, packed_ref)
+
+    torch.testing.assert_close(
+        scales,
+        scale_ref,
+        rtol=2e-3,
+        atol=2e-3,
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Iris fused kernel requires CUDA"
+)
+def test_fused_rope_int4_paged_append_matches_eager():
+    torch.manual_seed(3407)
+
+    device = torch.device("cuda")
+
+    num_tokens = 7
+    num_kv_heads = 4
+    head_dim = 128
+
+    rotary_dim = head_dim
+    group_size = 32
+    page_size = 16
+    num_pages = 4
+
+    key = torch.randn(
+        num_tokens,
+        num_kv_heads,
+        head_dim,
+        device=device,
+        dtype=torch.float16,
+    )
+
+    value = torch.randn_like(key)
+
+    positions = torch.tensor(
+        [0, 1, 2, 3, 4, 5, 6],
+        device=device,
+        dtype=torch.int32,
+    )
+
+    slot_mapping = torch.tensor(
+        [17, 2, -1, 31, 32, 47, 63],
+        device=device,
+        dtype=torch.int32,
+    )
+
+    max_position = int(positions.max().item()) + 1
+
+    position_ids = torch.arange(
+        max_position,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    inv_freq = 1.0 / (
+        10000.0
+        ** (
+            torch.arange(
+                0,
+                rotary_dim,
+                2,
+                device=device,
+                dtype=torch.float32,
+            )
+            / rotary_dim
+        )
+    )
+
+    freqs = position_ids[:, None] * inv_freq[None, :]
+
+    cos_cache = freqs.cos().to(torch.float16)
+    sin_cache = freqs.sin().to(torch.float16)
+
+    data_shape = (
+        num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim // 2,
+    )
+
+    scale_shape = (
+        num_pages,
+        page_size,
+        num_kv_heads,
+        head_dim // group_size,
+    )
+
+    k_data_init = torch.randint(
+        0,
+        256,
+        data_shape,
+        device=device,
+        dtype=torch.uint8,
+    )
+
+    v_data_init = torch.randint(
+        0,
+        256,
+        data_shape,
+        device=device,
+        dtype=torch.uint8,
+    )
+
+    k_scale_init = torch.randn(
+        scale_shape,
+        device=device,
+        dtype=torch.float16,
+    )
+
+    v_scale_init = torch.randn_like(k_scale_init)
+
+    k_data_ref = k_data_init.clone()
+    v_data_ref = v_data_init.clone()
+    k_scale_ref = k_scale_init.clone()
+    v_scale_ref = v_scale_init.clone()
+
+    k_data_fused = k_data_init.clone()
+    v_data_fused = v_data_init.clone()
+    k_scale_fused = k_scale_init.clone()
+    v_scale_fused = v_scale_init.clone()
+
+    torch_eager_append(
+        key,
+        value,
+        positions,
+        slot_mapping,
+        cos_cache,
+        sin_cache,
+        k_data_ref,
+        v_data_ref,
+        k_scale_ref,
+        v_scale_ref,
+        rotary_dim=rotary_dim,
+        group_size=group_size,
+        page_size=page_size,
+    )
+
+    fused_rope_int4_paged_append(
+        key,
+        value,
+        positions,
+        slot_mapping,
+        cos_cache,
+        sin_cache,
+        k_data_fused,
+        v_data_fused,
+        k_scale_fused,
+        v_scale_fused,
+        rotary_dim=rotary_dim,
+        group_size=group_size,
+        page_size=page_size,
+    )
+
+    torch.cuda.synchronize()
+
+    assert torch.equal(k_data_fused, k_data_ref)
+    assert torch.equal(v_data_fused, v_data_ref)
+    torch.testing.assert_close(
+        k_scale_fused,
+        k_scale_ref,
+        rtol=2e-3,
+        atol=2e-3,
+    )
+    assert torch.equal(v_scale_fused, v_scale_ref)

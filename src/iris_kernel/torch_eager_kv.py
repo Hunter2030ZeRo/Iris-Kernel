@@ -74,12 +74,18 @@ def quantize_int4_groupwise(
 
     amax = grouped.abs().amax(dim=-1)
 
-    scales = (amax / 7.0).clamp_min(1e-8)
+    min_scale = torch.finfo(x.dtype).tiny
 
-    q = torch.round(grouped / scales[..., None])
+    scale32 = (amax / 7.0).clamp_min(min_scale)
+
+    scales = scale32.to(x.dtype)
+
+    quant_scale = scales.float()
+
+    q = torch.round(grouped / quant_scale[..., None])
     q = q.clamp(-7, 7).to(torch.int8)
 
-    return q.reshape_as(x), scales.to(x.dtype)
+    return q.reshape_as(x), scales
 
 
 def pack_int4(q: torch.Tensor) -> torch.Tensor:
