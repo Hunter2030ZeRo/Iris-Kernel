@@ -468,6 +468,11 @@ def bench_case(
         inner=inner,
     )
 
+    fp16_bytes, int4_bytes, saving = logical_kv_storage_bytes(
+        head_dim,
+        group_size,
+    )
+
     return {
         "tokens": num_tokens,
         "eager_p50": eager_p50,
@@ -479,7 +484,43 @@ def bench_case(
         "vs_eager": eager_p50 / fused_p50,
         "vs_unfused": unfused_p50 / fused_p50,
         "tokens_per_sec": num_tokens / (fused_p50 * 1e-6),
+        "saving": saving,
     }
+
+
+def logical_kv_storage_bytes(
+    head_dim: int,
+    group_size: int,
+) -> tuple[int, int, float]:
+    fp16_size = torch.empty(
+        (),
+        dtype=torch.float16,
+    ).element_size()
+
+    uint8_size = torch.empty(
+        (),
+        dtype=torch.uint8,
+    ).element_size()
+
+    # K + V, each has head_dim FP16 values.
+    fp16_bytes = 2 * head_dim * fp16_size
+
+    # K + V, two INT4 values packed in one uint8.
+    int4_data_bytes = 2 * (head_dim // 2) * uint8_size
+
+    # One FP16 scale for every group_size values,
+    # independently for K and V.
+    scale_bytes = 2 * (head_dim // group_size) * fp16_size
+
+    int4_bytes = int4_data_bytes + scale_bytes
+
+    saving = (1.0 - int4_bytes / fp16_bytes) * 100.0
+
+    return (
+        fp16_bytes,
+        int4_bytes,
+        saving,
+    )
 
 
 def main():
@@ -517,19 +558,10 @@ def main():
             f"| {r['vs_eager']:.2f}x "
             f"| {r['vs_unfused']:.2f}x "
             f"| {r['tokens_per_sec']:,.0f} |"
+            f"| {r['saving']:,.0f}"
         )
 
     print()
-    fp16_bytes = 512
-    int4_bytes = 144
-
-    saving = (1.0 - int4_bytes / fp16_bytes) * 100.0
-
-    print(
-        f"KV storage: {fp16_bytes} -> "
-        f"{int4_bytes} bytes/token/KV-head "
-        f"({saving:.3f}% reduction)"
-    )
 
 
 if __name__ == "__main__":
