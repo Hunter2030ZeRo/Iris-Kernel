@@ -437,10 +437,10 @@ Iris implements both the producer and consumer paths needed to evaluate that que
 Python 3.12 or newer is required.
 
 ```bash
+git clone https://github.com/Hunter2030ZeRo/Iris-Kernel
+cd Iris-Kernel
 uv sync
 ```
-
-Then:
 
 ```bash
 uv run pytest -q
@@ -452,5 +452,4 @@ uv run python tests/bench_attention.py
 
 - Python
 - PyTorch
-- TileLang
-- CUDA
+- TileLang(CUDA)
